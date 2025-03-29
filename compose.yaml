@@ -1,0 +1,42 @@
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - votenet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mattermost:
+    image: mattermost/mattermost-team-edition
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: ${MM_SQLSETTINGS_DRIVERNAME}
+      MM_SQLSETTINGS_DATASOURCE: ${MM_SQLSETTINGS_DATASOURCE}
+      MATTERMOST_URL: ${MATTERMOST_URL}
+    ports:
+      - "8065:8065"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - votenet
+    healthcheck:
+      test: ["CMD", "curl", "-f", "${MATTERMOST_URL}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  votenet:
+
+volumes:
+  postgres_data:
