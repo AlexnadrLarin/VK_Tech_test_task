@@ -10,6 +10,8 @@ import (
 
 	"polling_bot/internal/bot"
 	"polling_bot/internal/config"
+    "polling_bot/internal/handler"
+    "polling_bot/internal/service"
 )
 
 func main() {
@@ -30,7 +32,17 @@ func main() {
         },
     ).With().Timestamp().Logger()
 
-	bot := bot.NewBot(cfg, logger)
+    repo := service.NewInMemoryPollStorage()
+
+    service := service.NewPollService(repo)
+
+    handler := handler.NewPollCommandHandler(service)
+
+	bot, err := bot.NewBot(cfg, logger, handler)
+    if  err != nil {
+		logger.Err(err).Msg("Не удалось создать бота: %v")
+        return 
+	}
 
 	if err := bot.Start(ctx); err != nil {
 		logger.Err(err).Msg("Не удалось запустить бота: %v")

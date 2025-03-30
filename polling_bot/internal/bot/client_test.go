@@ -4,26 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"polling_bot/internal/config"
-	"polling_bot/internal/service"
 
 	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/mock"
 )
 
-// ########################
-// ### Mocks and Fixtures
-// ########################
-
+// Mocks 
 type fakeClient struct {
 	Transport      http.RoundTripper
 	getMeFunc      func(string) (*model.User, *model.Response)
@@ -42,20 +37,10 @@ func (f *fakeClient) CreatePost(post *model.Post) (*model.Post, *model.Response)
 }
 
 type fakeWSClient struct {
-	events    chan *model.WebSocketEvent
-	autoClose bool
-	sendEvent bool
+	events chan *model.WebSocketEvent
 }
 
 func (f *fakeWSClient) Listen() {
-	go func() {
-		if f.autoClose {
-			defer close(f.events)
-		}
-		if f.sendEvent {
-			f.events <- &model.WebSocketEvent{Event: "test_event"}
-		}
-	}()
 }
 
 func (f *fakeWSClient) Close() {
@@ -78,12 +63,27 @@ func (m *mockHTTPClient) RoundTrip(req *http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("mockHTTPClient: unknown request %v", req.URL)
 }
 
-// ########################
-// ### TestCases
-// ########################
+type MockCommandHandler struct {
+	mock.Mock
+}
 
-// Тесты функций обработки url
-// ###########################
+func (m *MockCommandHandler) ParseCommand(input string) (string, []string, bool) {
+	args := m.Called(input)
+	return args.String(0), args.Get(1).([]string), args.Bool(2)
+}
+
+func (m *MockCommandHandler) HandleCommand(ctx context.Context, command string, args []string, userID string) (string, error) {
+	arguments := m.Called(ctx, command, args, userID)
+	return arguments.String(0), arguments.Error(1)
+}
+
+func (m *MockCommandHandler) GetHelpText() string {
+	return m.Called().String(0)
+}
+
+// TestCases
+
+// TestNewBot_PrependHTTP проверяет, что при отсутствии префикса "http://" URL корректно дополняется.
 func TestNewBot_PrependHTTP(t *testing.T) {
 	cfg := config.Config{
 		MattermostURL: "mattermost.example.com",
@@ -91,12 +91,14 @@ func TestNewBot_PrependHTTP(t *testing.T) {
 		HTTPTimeout:   time.Second,
 	}
 	logger := zerolog.Nop()
-	bot := NewBot(cfg, logger)
+	mockHandler := new(MockCommandHandler)
+	bot, _ := NewBot(cfg, logger, mockHandler)
 	if !strings.HasPrefix(bot.cfg.MattermostURL, "http://") {
 		t.Errorf("Ожидалось, что URL начнётся с http://, получено: %s", bot.cfg.MattermostURL)
 	}
 }
 
+// TestNewBot_ValidURL проверяет, что корректный URL не изменяется.
 func TestNewBot_ValidURL(t *testing.T) {
 	cfg := config.Config{
 		MattermostURL: "https://mattermost.example.com",
@@ -104,14 +106,14 @@ func TestNewBot_ValidURL(t *testing.T) {
 		HTTPTimeout:   time.Second,
 	}
 	logger := zerolog.Nop()
-	bot := NewBot(cfg, logger)
+	mockHandler := new(MockCommandHandler)
+	bot, _ := NewBot(cfg, logger, mockHandler)
 	if bot.cfg.MattermostURL != "https://mattermost.example.com" {
 		t.Errorf("URL не должен изменяться, получено: %s", bot.cfg.MattermostURL)
 	}
 }
 
-// Тесты функций для иницализации http-клиента
-// ###########################################
+// TestAuthenticate_Success проверяет успешную аутентификацию бота.
 func TestAuthenticate_Success(t *testing.T) {
 	fc := &fakeClient{
 		getMeFunc: func(param string) (*model.User, *model.Response) {
@@ -131,6 +133,7 @@ func TestAuthenticate_Success(t *testing.T) {
 	}
 }
 
+// TestAuthenticate_Error проверяет обработку ошибки аутентификации.
 func TestAuthenticate_Error(t *testing.T) {
 	fc := &fakeClient{
 		getMeFunc: func(param string) (*model.User, *model.Response) {
@@ -149,8 +152,7 @@ func TestAuthenticate_Error(t *testing.T) {
 	}
 }
 
-// Тесты функций для иницализации WebSocket
-// ###########################################
+// TestInitWebSocket_Success проверяет успешную инициализацию WebSocket клиента.
 func TestInitWebSocket_Success(t *testing.T) {
 	cfg := config.Config{
 		MattermostURL: "http://example.com",
@@ -158,7 +160,8 @@ func TestInitWebSocket_Success(t *testing.T) {
 		HTTPTimeout:   time.Second,
 	}
 
-	bot := NewBot(cfg, zerolog.Nop())
+	mockHandler := new(MockCommandHandler)
+	bot, _ := NewBot(cfg, zerolog.Nop(), mockHandler)
 
 	bot.wsClient = &fakeWSClient{
 		events: make(chan *model.WebSocketEvent),
@@ -173,21 +176,26 @@ func TestInitWebSocket_Success(t *testing.T) {
 	}
 }
 
-func TestInitWebSocket_Error(t *testing.T) {
+// TestInitWebSocket_InvalidToken проверяет, что при неверном токене инициализация WebSocket завершится ошибкой.
+func TestInitWebSocket_InvalidToken(t *testing.T) {
 	cfg := config.Config{
-		MattermostURL: "",
-		BotToken:      "dummy",
+		MattermostURL: "ws://valid.url",
+		BotToken:      "invalid_token",
 		HTTPTimeout:   time.Second,
 	}
-	bot := NewBot(cfg, zerolog.Nop())
+
+	bot := &Bot{
+		cfg:    cfg,
+		logger: zerolog.Nop(),
+	}
+
 	err := bot.initWebSocket()
 	if err == nil {
-		t.Error("Ожидалась ошибка инициализации WebSocket при некорректном URL, но ошибка не получена")
+		t.Error("Ожидалась ошибка аутентификации WebSocket")
 	}
 }
 
-// Тесты функций для общей инициализации
-// ###########################################
+// TestInitialize_Success проверяет общую инициализацию бота.
 func TestInitialize_Success(t *testing.T) {
 	fc := &fakeClient{
 		getMeFunc: func(param string) (*model.User, *model.Response) {
@@ -209,7 +217,8 @@ func TestInitialize_Success(t *testing.T) {
 		HTTPTimeout:   time.Second,
 	}
 
-	bot := NewBot(cfg, zerolog.Nop())
+	mockHandler := new(MockCommandHandler)
+	bot, _ := NewBot(cfg, zerolog.Nop(), mockHandler)
 	bot.client = fc
 	bot.botUser = &model.User{Id: "bot123"}
 	bot.wsClient = ws
@@ -226,211 +235,78 @@ func TestInitialize_Success(t *testing.T) {
 	}
 }
 
-// Тесты основной логики
-// #####################
-func TestStart_ContextCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ws := &fakeWSClient{
-		events: make(chan *model.WebSocketEvent),
-	}
-
-	fc := &fakeClient{
-		getMeFunc: func(param string) (*model.User, *model.Response) {
-			return &model.User{Id: "bot123"}, &model.Response{}
-		},
-		createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
-			return post, &model.Response{}
-		},
-	}
-	cfg := config.Config{
-		MattermostURL: "http://dummy",
-		BotToken:      "dummy",
-		HTTPTimeout:   time.Second,
-	}
-
-	bot := NewBot(cfg, zerolog.Nop())
-	bot.client = fc
-	bot.botUser = &model.User{Id: "bot123"}
-	bot.wsClient = ws
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- bot.Start(ctx)
-	}()
-	time.Sleep(50 * time.Millisecond)
-
-	cancel()
-
-	select {
-	case err := <-errCh:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("Ожидался context.Canceled, получено: %v", err)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Тест не дождался завершения")
-	}
-}
-
-// Тест хендлера аргументов
+// TestHandleWebSocketEvent проверяет корректную обработку входящего события с командой.
 func TestHandleWebSocketEvent(t *testing.T) {
-	mockService := service.PollService{}
-
-	var lastPost *model.Post
-	fc := &fakeClient{
-		getMeFunc: func(param string) (*model.User, *model.Response) {
-			return &model.User{Id: "bot123"}, &model.Response{}
-		},
-		createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
-			lastPost = post
-			return post, &model.Response{}
-		},
-	}
-
-	bot := &Bot{
-		service:  mockService,
-		logger:   zerolog.Nop(),
-		botUser:  &model.User{Id: "bot123"},
-		client:   fc,
-		wsClient: &fakeWSClient{},
-	}
+	mockHandler := new(MockCommandHandler)
+	logger := zerolog.Nop()
 
 	tests := []struct {
-		name        string
-		inputMsg    string
-		wantMessage string
-		setup       func(*Bot)
-		inputUser   string
-		eventType   string
+		name          string
+		inputMsg      string
+		mockSetup     func(*MockCommandHandler)
+		expectedCalls int
+		wantMessage   string
 	}{
 		{
-			name:        "help command",
-			inputMsg:    "!poll help",
-			wantMessage: "**Команды опросов:**",
-			eventType:   "post",
-		},
-		{
-			name:        "create poll success",
-			inputMsg:    `!poll create "Ваш вопрос?" "Вариант 1" "Вариант 2"`,
-			wantMessage: "Голосование создано успешно! ID: mock-poll-123",
-			eventType:   "post",
-		},
-		{
-			name:        "create poll insufficient args",
-			inputMsg:    "!poll create Вопрос",
-			wantMessage: "Недостаточно аргументов. Нужен вопрос и хотя бы одна опция",
-			eventType:   "post",
-		},
-		{
-			name:        "vote command",
-			inputMsg:    `!poll vote "test-poll" "Вариант 1"`,
-			wantMessage: "Ваш голос в голосовании test-poll записан: Вариант 1",
-			eventType:   "post",
-		},
-		{
-			name:        "results command",
-			inputMsg:    `!poll results "test-poll"`,
-			wantMessage: "Результаты Голосования (mock):",
-			eventType:   "post",
-		},
-		{
-			name:        "end poll success",
-			inputMsg:    `!poll end "test-poll"`,
-			wantMessage: "Голосование test-poll окончено",
-			eventType:   "post",
-		},
-		{
-			name:        "end poll insufficient args",
-			inputMsg:    "!poll end",
-			wantMessage: "Формат: !poll end \"ID опроса\"",
-			eventType:   "post",
-		},
-		{
-			name:        "delete poll success",
-			inputMsg:    `!poll delete "test-poll"`,
-			wantMessage: "Голосование test-poll удалено",
-			eventType:   "post",
-		},
-		{
-			name:        "delete poll insufficient args",
-			inputMsg:    "!poll delete",
-			wantMessage: "Формат: !poll delete \"ID опроса\"",
-			eventType:   "post",
-		},
-		{
-			name:        "unknown command",
-			inputMsg:    "!poll invalid",
-			wantMessage: "Неизвестная команда. Введите !poll help для справки",
-			eventType:   "post",
-		},
-		{
-			name:     "insufficient number of arguments",
-			inputMsg: "!poll",
-			wantMessage: `**Команды опросов:**
-    !poll create "Вопрос" "Опция 1" "Опция 2"... - Создать опрос
-    !poll vote "ID опроса" "Выбор" - Проголосовать
-    !poll results "ID опроса" - Показать результаты
-    !poll end "ID опроса" - Завершить опрос
-    !poll delete "ID опроса" - Удалить опрос
-    !poll help - Показать эту справку`,
-			eventType: "post",
-		},
-		{
-			name:        "empty message",
-			inputMsg:    "",
-			wantMessage: "",
-			eventType:   "post",
-		},
-		{
-			name:        "service error handling",
-			inputMsg:    `!poll create "Question"`,
-			wantMessage: "Недостаточно аргументов. Нужен вопрос и хотя бы одна опция",
-			eventType:   "post",
-		},
-		{
-			name:        "complex arguments parsing",
-			inputMsg:    `!poll create 'Вопрос с "разными" кавычками' "Вариант с пробелом"`,
-			wantMessage: "Голосование создано успешно! ID: mock-poll-123",
-			eventType:   "post",
-		},
-		{
-			name:        "mixed quotes arguments",
-			inputMsg:    `!poll vote "test'poll" "Вариант'1"`,
-			wantMessage: "Ваш голос в голосовании test'poll записан: Вариант'1",
-			eventType:   "post",
-		},
-		{
-			name:        "message from bot itself",
-			inputMsg:    "!poll help",
-			wantMessage: "",
-			setup: func(b *Bot) {
-				b.botUser.Id = "current_bot_user"
+			name:     "valid create command",
+			inputMsg: `!poll create "Question" "Option1"`,
+			mockSetup: func(m *MockCommandHandler) {
+				m.On("ParseCommand", `!poll create "Question" "Option1"`).
+					Return("create", []string{"Question", "Option1"}, true).
+					Once()
+				m.On("HandleCommand", mock.Anything, "create", []string{"Question", "Option1"}, "user123").
+					Return("Poll created", nil).
+					Once()
 			},
-			inputUser: "current_bot_user",
+			expectedCalls: 1,
+			wantMessage:   "Poll created",
 		},
 		{
-			name:        "invalid websocket event type",
-			inputMsg:    "!poll help",
-			wantMessage: "",
-			eventType:   "other_event",
+			name:     "invalid command",
+			inputMsg: "invalid command",
+			mockSetup: func(m *MockCommandHandler) {
+				m.On("ParseCommand", "invalid command").
+					Return("", []string{}, false).
+					Once()
+			},
+			expectedCalls: 1,
+			wantMessage:   "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lastPost = nil
+			mockHandler.ExpectedCalls = nil
+			if tt.mockSetup != nil {
+				tt.mockSetup(mockHandler)
+			}
+
+			var lastPost *model.Post
+			fc := &fakeClient{
+				createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
+					lastPost = post
+					return post, &model.Response{}
+				},
+			}
+
+			bot := &Bot{
+				commandHandler: mockHandler,
+				logger:         logger,
+				botUser:        &model.User{Id: "bot123"},
+				client:         fc,
+			}
 
 			post := model.Post{
 				ChannelId: "test-channel",
 				UserId:    "user123",
 				Message:   tt.inputMsg,
 			}
-			postBytes, _ := json.Marshal(post)
+			postBytes, _ := json.Marshal(&post)
+
 			event := &model.WebSocketEvent{
 				Event: model.WEBSOCKET_EVENT_POSTED,
 				Data: map[string]interface{}{
-					tt.eventType: string(postBytes),
+					"post": string(postBytes),
 				},
 			}
 
@@ -440,102 +316,81 @@ func TestHandleWebSocketEvent(t *testing.T) {
 				if lastPost == nil {
 					t.Fatal("Сообщение не было отправлено")
 				}
-
 				if !strings.Contains(lastPost.Message, tt.wantMessage) {
-					t.Errorf("Ожидалось: %q\nПолучено: %q",
-						tt.wantMessage, lastPost.Message)
+					t.Errorf("Ожидалось: %q\nПолучено: %q", tt.wantMessage, lastPost.Message)
 				}
+			} else if lastPost != nil {
+				t.Error("Сообщение было отправлено, хотя не должно было")
 			}
+
+			mockHandler.AssertNumberOfCalls(t, "HandleCommand", tt.expectedCalls)
+			mockHandler.AssertExpectations(t)
 		})
 	}
 }
 
-// Тест парсера аргументов
-func TestParseCommandArgs(t *testing.T) {
-	bot := &Bot{logger: zerolog.Nop()}
+// TestHandleWebSocketEventEdgeCases проверяет обработку некорректных входящих данных.
+func TestHandleWebSocketEventEdgeCases(t *testing.T) {
+	mockHandler := new(MockCommandHandler)
+	logger := zerolog.Nop()
 
 	tests := []struct {
-		name     string
-		input    string
-		expected []string
+		name        string
+		eventSetup  func() *model.WebSocketEvent
+		expectError bool
 	}{
 		{
-			name:     "basic quoted arguments",
-			input:    `!poll create "Вопрос с пробелами" "Вариант 1"`,
-			expected: []string{"!poll", "create", "Вопрос с пробелами", "Вариант 1"},
+			name: "invalid post data",
+			eventSetup: func() *model.WebSocketEvent {
+				return &model.WebSocketEvent{
+					Event: model.WEBSOCKET_EVENT_POSTED,
+					Data:  map[string]interface{}{"post": 123},
+				}
+			},
 		},
 		{
-			name:     "single quoted arguments",
-			input:    `!poll vote 'test-id' 'Мой выбор'`,
-			expected: []string{"!poll", "vote", "test-id", "Мой выбор"},
-		},
-		{
-			name:     "unquoted arguments",
-			input:    "!poll results simpleID",
-			expected: []string{"!poll", "results", "simpleID"},
-		},
-		{
-			name:     "mixed quotes inside arguments",
-			input:    `!poll create "Вопрос 'с' кавычками" 'И "другой" вариант'`,
-			expected: []string{"!poll", "create", "Вопрос 'с' кавычками", "И \"другой\" вариант"},
-		},
-		{
-			name:     "empty argument",
-			input:    `!poll create "" "Вариант"`,
-			expected: []string{"!poll", "create", "", "Вариант"},
-		},
-		{
-			name:     "unicode and emoji",
-			input:    `!poll create "Тест 𝌆йцукен" "☀️🌙"`,
-			expected: []string{"!poll", "create", "Тест 𝌆йцукен", "☀️🌙"},
-		},
-		{
-			name:     "multiple spaces",
-			input:    "!poll   create   Вопрос    'Вариант A'",
-			expected: []string{"!poll", "create", "Вопрос", "Вариант A"},
-		},
-		{
-			name:     "nested quotes",
-			input:    `!poll create "'Смешанные' кавычки"`,
-			expected: []string{"!poll", "create", "'Смешанные' кавычки"},
-		},
-		{
-			name:     "no arguments",
-			input:    "!poll",
-			expected: []string{"!poll"},
-		},
-		{
-			name:     "escape characters (if supported)",
-			input:    `!poll create "Экранированные \"кавычки\""`,
-			expected: []string{"!poll", "create", `Экранированные "кавычки"`},
-		},
-		{
-			name:     "special characters",
-			input:    `!poll create "!@#$%^&*()_+" "{}[];:,.<>/?~"`,
-			expected: []string{"!poll", "create", "!@#$%^&*()_+", "{}[];:,.<>/?~"},
-		},
-		{
-			name:     "asian characters",
-			input:    `!poll create "日本語のテスト" "한글 테스트"`,
-			expected: []string{"!poll", "create", "日本語のテスト", "한글 테스트"},
-		},
-		{
-			name:     "arabic text",
-			input:    `!poll create "اختبار العربية"`,
-			expected: []string{"!poll", "create", "اختبار العربية"},
+			name: "message from bot itself",
+			eventSetup: func() *model.WebSocketEvent {
+				post := model.Post{
+					UserId: "bot123",
+				}
+				postBytes, _ := json.Marshal(&post)
+				return &model.WebSocketEvent{
+					Event: model.WEBSOCKET_EVENT_POSTED,
+					Data:  map[string]interface{}{"post": string(postBytes)},
+				}
+			},
 		},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := bot.parseCommandArgs(tt.input)
-			if !reflect.DeepEqual(got, tt.expected) {
-				t.Errorf("Ожидалось %v, получено %v", tt.expected, got)
+		t.Run(tt.name, func(t *testing.T) {
+			var called bool
+			fc := &fakeClient{
+				createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
+					called = true
+					return post, &model.Response{}
+				},
+			}
+
+			bot := &Bot{
+				commandHandler: mockHandler,
+				logger:         logger,
+				botUser:        &model.User{Id: "bot123"},
+				client:         fc,
+			}
+
+			event := tt.eventSetup()
+			bot.handleWebSocketEvent(context.Background(), event)
+
+			if called {
+				t.Error("CreatePost был вызван неожиданно")
 			}
 		})
 	}
 }
 
+// TestHandleWebSocketEventNonPosted проверяет, что события, отличные от WEBSOCKET_EVENT_POSTED, игнорируются.
 func TestHandleWebSocketEventNonPosted(t *testing.T) {
 	called := false
 	fc := &fakeClient{
@@ -568,6 +423,7 @@ func TestHandleWebSocketEventNonPosted(t *testing.T) {
 	}
 }
 
+// TestHandleWebSocketEventOwnMessage проверяет, что сообщения, отправленные самим ботом, игнорируются.
 func TestHandleWebSocketEventOwnMessage(t *testing.T) {
 	called := false
 	fc := &fakeClient{
@@ -585,7 +441,7 @@ func TestHandleWebSocketEventOwnMessage(t *testing.T) {
 		UserId:    "bot123",
 		Message:   "Привет, бот!",
 	}
-	postBytes, err := json.Marshal(originalPost)
+	postBytes, err := json.Marshal(&originalPost)
 	if err != nil {
 		t.Fatal("Не удалось сериализовать пост:", err)
 	}
@@ -610,12 +466,101 @@ func TestHandleWebSocketEventOwnMessage(t *testing.T) {
 	}
 }
 
-// Тест закрытия соединений
-// ##################
+
+
+// TestStart_CtxCanceled проверяет, что функция Start корректно завершается при отмене контекста.
+func TestStart_CtxCanceled(t *testing.T) {
+	fc := &fakeClient{
+		getMeFunc: func(param string) (*model.User, *model.Response) {
+			return &model.User{Id: "bot123"}, &model.Response{}
+		},
+		createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
+			return post, &model.Response{}
+		},
+		Transport: &mockHTTPClient{},
+	}
+
+	ws := &fakeWSClient{
+		events: make(chan *model.WebSocketEvent, 1),
+	}
+
+	cfg := config.Config{
+		MattermostURL: "http://dummy",
+		BotToken:      "dummy",
+		HTTPTimeout:   time.Second,
+	}
+
+	mockHandler := new(MockCommandHandler)
+	bot, _ := NewBot(cfg, zerolog.Nop(), mockHandler)
+	bot.client = fc
+	bot.botUser = &model.User{Id: "bot123"}
+	bot.wsClient = ws
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := bot.Start(ctx)
+	if err == nil {
+		t.Errorf("Ожидалась ошибка отмены контекста, но ошибок не возникло")
+	} else if err != context.Canceled {
+		t.Errorf("Ожидалась ошибка context.Canceled, но получена: %v", err)
+	}
+}
+
+// TestStart_AuthFail проверяет, что Start завершается с ошибкой при неуспешной аутентификации.
+func TestStart_AuthFail(t *testing.T) {
+	fc := &fakeClient{
+		getMeFunc: func(param string) (*model.User, *model.Response) {
+			return nil, &model.Response{Error: &model.AppError{Message: "authentication failed"}}
+		},
+	}
+
+	cfg := config.Config{
+		MattermostURL: "http://dummy",
+		BotToken:      "dummy",
+		HTTPTimeout:   time.Second,
+	}
+
+	mockHandler := new(MockCommandHandler)
+	bot, _ := NewBot(cfg, zerolog.Nop(), mockHandler)
+	bot.client = fc
+
+	err := bot.Start(context.Background())
+	if err == nil {
+		t.Error("Ожидалась ошибка при аутентификации, но получен nil")
+	}
+}
+
+// TestStart_WebSocketFail проверяет, что Start завершается с ошибкой при неуспешной инициализации WebSocket.
+func TestStart_WebSocketFail(t *testing.T) {
+	fc := &fakeClient{
+		getMeFunc: func(param string) (*model.User, *model.Response) {
+			return &model.User{Id: "bot123"}, &model.Response{}
+		},
+	}
+
+	cfg := config.Config{
+		MattermostURL: "http://dummy",
+		BotToken:      "dummy",
+		HTTPTimeout:   time.Second,
+	}
+
+	mockHandler := new(MockCommandHandler)
+	bot, _ := NewBot(cfg, zerolog.Nop(), mockHandler)
+	bot.client = fc
+	bot.botUser = &model.User{Id: "bot123"}
+	bot.wsClient = nil
+
+	err := bot.Start(context.Background())
+	if err == nil {
+		t.Error("Ожидалась ошибка при инициализации WebSocket, но получен nil")
+	}
+}
+
+// TestCloseConnections проверяет, что метод Close корректно закрывает канал событий.
 func TestCloseConnections(t *testing.T) {
 	ws := &fakeWSClient{
-		events:    make(chan *model.WebSocketEvent),
-		autoClose: false,
+		events: make(chan *model.WebSocketEvent),
 	}
 
 	bot := &Bot{
