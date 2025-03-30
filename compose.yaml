@@ -1,6 +1,6 @@
 
 services:
-  db:
+  mattermost_db:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -25,7 +25,7 @@ services:
     ports:
       - "8065:8065"
     depends_on:
-      db:
+      mattermost_db:
         condition: service_healthy
     networks:
       - votenet
@@ -34,6 +34,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  polling_bot:
+    build: 
+      context: ./polling_bot
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      MATTERMOST_URL: ${MATTERMOST_URL}
+    depends_on:
+      mattermost:
+        condition: service_healthy
+    networks:
+      - votenet
+    restart: unless-stopped
 
 networks:
   votenet:
