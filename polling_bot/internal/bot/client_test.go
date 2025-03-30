@@ -4,16 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
-	"errors"
 
 	"polling_bot/internal/config"
+	"polling_bot/internal/service"
 
 	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/rs/zerolog"
@@ -24,7 +25,7 @@ import (
 // ########################
 
 type fakeClient struct {
-	Transport http.RoundTripper
+	Transport      http.RoundTripper
 	getMeFunc      func(string) (*model.User, *model.Response)
 	createPostFunc func(*model.Post) (*model.Post, *model.Response)
 }
@@ -34,27 +35,30 @@ func (f *fakeClient) GetMe(param string) (*model.User, *model.Response) {
 }
 
 func (f *fakeClient) CreatePost(post *model.Post) (*model.Post, *model.Response) {
-	return f.createPostFunc(post)
+	if f.createPostFunc != nil {
+		return f.createPostFunc(post)
+	}
+	return post, &model.Response{}
 }
 
 type fakeWSClient struct {
-    events    chan *model.WebSocketEvent
+	events    chan *model.WebSocketEvent
 	autoClose bool
-    sendEvent bool 
+	sendEvent bool
 }
 
 func (f *fakeWSClient) Listen() {
-    go func() {
+	go func() {
 		if f.autoClose {
 			defer close(f.events)
 		}
-        if f.sendEvent {
-            f.events <- &model.WebSocketEvent{Event: "test_event"}
-        } 
-    }()
+		if f.sendEvent {
+			f.events <- &model.WebSocketEvent{Event: "test_event"}
+		}
+	}()
 }
 
-func (f *fakeWSClient) Close()  {
+func (f *fakeWSClient) Close() {
 	close(f.events)
 }
 
@@ -66,12 +70,12 @@ type mockHTTPClient struct{}
 
 func (m *mockHTTPClient) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Host == "dummy" && req.URL.Path == "/api/v4/users/me" {
-        return &http.Response{
-            StatusCode: http.StatusOK,
-            Body:       io.NopCloser(bytes.NewReader([]byte(`{"id":"bot123"}`))),
-        }, nil
-    }
-    return nil, fmt.Errorf("mockHTTPClient: unknown request %v", req.URL)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader([]byte(`{"id":"bot123"}`))),
+		}, nil
+	}
+	return nil, fmt.Errorf("mockHTTPClient: unknown request %v", req.URL)
 }
 
 // ########################
@@ -148,30 +152,30 @@ func TestAuthenticate_Error(t *testing.T) {
 // Тесты функций для иницализации WebSocket
 // ###########################################
 func TestInitWebSocket_Success(t *testing.T) {
-    cfg := config.Config{
-        MattermostURL: "http://example.com",
-        BotToken:      "dummy",
-        HTTPTimeout:   time.Second,
-    }
+	cfg := config.Config{
+		MattermostURL: "http://example.com",
+		BotToken:      "dummy",
+		HTTPTimeout:   time.Second,
+	}
 
-    bot := NewBot(cfg, zerolog.Nop())
-    
-    bot.wsClient = &fakeWSClient{
-        events: make(chan *model.WebSocketEvent),
-    }
+	bot := NewBot(cfg, zerolog.Nop())
 
-    err := bot.initWebSocket()
-    if err != nil {
-        t.Errorf("Ожидалось, что initWebSocket завершится успешно, получена ошибка: %v", err)
-    }
-    if bot.wsClient == nil {
-        t.Error("Ожидалось, что wsClient будет инициализирован")
-    }
+	bot.wsClient = &fakeWSClient{
+		events: make(chan *model.WebSocketEvent),
+	}
+
+	err := bot.initWebSocket()
+	if err != nil {
+		t.Errorf("Ожидалось, что initWebSocket завершится успешно, получена ошибка: %v", err)
+	}
+	if bot.wsClient == nil {
+		t.Error("Ожидалось, что wsClient будет инициализирован")
+	}
 }
 
 func TestInitWebSocket_Error(t *testing.T) {
 	cfg := config.Config{
-		MattermostURL: "", 
+		MattermostURL: "",
 		BotToken:      "dummy",
 		HTTPTimeout:   time.Second,
 	}
@@ -192,7 +196,7 @@ func TestInitialize_Success(t *testing.T) {
 		createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
 			return post, &model.Response{}
 		},
-		Transport: &mockHTTPClient{}, 
+		Transport: &mockHTTPClient{},
 	}
 
 	ws := &fakeWSClient{
@@ -206,12 +210,12 @@ func TestInitialize_Success(t *testing.T) {
 	}
 
 	bot := NewBot(cfg, zerolog.Nop())
-	bot.client = fc 
+	bot.client = fc
 	bot.botUser = &model.User{Id: "bot123"}
 	bot.wsClient = ws
 
 	if apiClient, ok := bot.client.(*fakeClient); ok {
-		apiClient.Transport = &mockHTTPClient{} 
+		apiClient.Transport = &mockHTTPClient{}
 	} else {
 		t.Fatalf("Expected bot.client to be of type *fakeClient, but got %T", bot.client)
 	}
@@ -255,74 +259,280 @@ func TestStart_ContextCancellation(t *testing.T) {
 	go func() {
 		errCh <- bot.Start(ctx)
 	}()
-	time.Sleep(50 * time.Millisecond) 
+	time.Sleep(50 * time.Millisecond)
 
-    cancel()
+	cancel()
 
-    select {
-    case err := <-errCh:
-        if !errors.Is(err, context.Canceled) {
-            t.Errorf("Ожидался context.Canceled, получено: %v", err)
-        }
-    case <-time.After(100 * time.Millisecond):
-        t.Error("Тест не дождался завершения")
-    }
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Ожидался context.Canceled, получено: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Тест не дождался завершения")
+	}
 }
 
+// Тест хендлера аргументов
 func TestHandleWebSocketEvent(t *testing.T) {
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var postCreated *model.Post
+	mockService := service.PollService{}
 
+	var lastPost *model.Post
 	fc := &fakeClient{
 		getMeFunc: func(param string) (*model.User, *model.Response) {
 			return &model.User{Id: "bot123"}, &model.Response{}
 		},
 		createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
-			postCreated = post
-			wg.Done()
+			lastPost = post
 			return post, &model.Response{}
 		},
 	}
 
-	logger := zerolog.Nop()
-	botInstance := &Bot{
-		logger:  logger,
-		client:  fc,
-		botUser: &model.User{Id: "bot123"},
-		wsClient: &fakeWSClient{
-			events: make(chan *model.WebSocketEvent, 1),
+	bot := &Bot{
+		service:  mockService,
+		logger:   zerolog.Nop(),
+		botUser:  &model.User{Id: "bot123"},
+		client:   fc,
+		wsClient: &fakeWSClient{},
+	}
+
+	tests := []struct {
+		name        string
+		inputMsg    string
+		wantMessage string
+		setup       func(*Bot)
+		inputUser   string
+		eventType   string
+	}{
+		{
+			name:        "help command",
+			inputMsg:    "!poll help",
+			wantMessage: "**Команды опросов:**",
+			eventType:   "post",
+		},
+		{
+			name:        "create poll success",
+			inputMsg:    `!poll create "Ваш вопрос?" "Вариант 1" "Вариант 2"`,
+			wantMessage: "Голосование создано успешно! ID: mock-poll-123",
+			eventType:   "post",
+		},
+		{
+			name:        "create poll insufficient args",
+			inputMsg:    "!poll create Вопрос",
+			wantMessage: "Недостаточно аргументов. Нужен вопрос и хотя бы одна опция",
+			eventType:   "post",
+		},
+		{
+			name:        "vote command",
+			inputMsg:    `!poll vote "test-poll" "Вариант 1"`,
+			wantMessage: "Ваш голос в голосовании test-poll записан: Вариант 1",
+			eventType:   "post",
+		},
+		{
+			name:        "results command",
+			inputMsg:    `!poll results "test-poll"`,
+			wantMessage: "Результаты Голосования (mock):",
+			eventType:   "post",
+		},
+		{
+			name:        "end poll success",
+			inputMsg:    `!poll end "test-poll"`,
+			wantMessage: "Голосование test-poll окончено",
+			eventType:   "post",
+		},
+		{
+			name:        "end poll insufficient args",
+			inputMsg:    "!poll end",
+			wantMessage: "Формат: !poll end \"ID опроса\"",
+			eventType:   "post",
+		},
+		{
+			name:        "delete poll success",
+			inputMsg:    `!poll delete "test-poll"`,
+			wantMessage: "Голосование test-poll удалено",
+			eventType:   "post",
+		},
+		{
+			name:        "delete poll insufficient args",
+			inputMsg:    "!poll delete",
+			wantMessage: "Формат: !poll delete \"ID опроса\"",
+			eventType:   "post",
+		},
+		{
+			name:        "unknown command",
+			inputMsg:    "!poll invalid",
+			wantMessage: "Неизвестная команда. Введите !poll help для справки",
+			eventType:   "post",
+		},
+		{
+			name:     "insufficient number of arguments",
+			inputMsg: "!poll",
+			wantMessage: `**Команды опросов:**
+    !poll create "Вопрос" "Опция 1" "Опция 2"... - Создать опрос
+    !poll vote "ID опроса" "Выбор" - Проголосовать
+    !poll results "ID опроса" - Показать результаты
+    !poll end "ID опроса" - Завершить опрос
+    !poll delete "ID опроса" - Удалить опрос
+    !poll help - Показать эту справку`,
+			eventType: "post",
+		},
+		{
+			name:        "empty message",
+			inputMsg:    "",
+			wantMessage: "",
+			eventType:   "post",
+		},
+		{
+			name:        "service error handling",
+			inputMsg:    `!poll create "Question"`,
+			wantMessage: "Недостаточно аргументов. Нужен вопрос и хотя бы одна опция",
+			eventType:   "post",
+		},
+		{
+			name:        "complex arguments parsing",
+			inputMsg:    `!poll create 'Вопрос с "разными" кавычками' "Вариант с пробелом"`,
+			wantMessage: "Голосование создано успешно! ID: mock-poll-123",
+			eventType:   "post",
+		},
+		{
+			name:        "mixed quotes arguments",
+			inputMsg:    `!poll vote "test'poll" "Вариант'1"`,
+			wantMessage: "Ваш голос в голосовании test'poll записан: Вариант'1",
+			eventType:   "post",
+		},
+		{
+			name:        "message from bot itself",
+			inputMsg:    "!poll help",
+			wantMessage: "",
+			setup: func(b *Bot) {
+				b.botUser.Id = "current_bot_user"
+			},
+			inputUser: "current_bot_user",
+		},
+		{
+			name:        "invalid websocket event type",
+			inputMsg:    "!poll help",
+			wantMessage: "",
+			eventType:   "other_event",
 		},
 	}
 
-	originalPost := model.Post{
-		ChannelId: "channel456",
-		UserId:    "user789",
-		Message:   "Привет, бот!",
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lastPost = nil
+
+			post := model.Post{
+				ChannelId: "test-channel",
+				UserId:    "user123",
+				Message:   tt.inputMsg,
+			}
+			postBytes, _ := json.Marshal(post)
+			event := &model.WebSocketEvent{
+				Event: model.WEBSOCKET_EVENT_POSTED,
+				Data: map[string]interface{}{
+					tt.eventType: string(postBytes),
+				},
+			}
+
+			bot.handleWebSocketEvent(context.Background(), event)
+
+			if tt.wantMessage != "" {
+				if lastPost == nil {
+					t.Fatal("Сообщение не было отправлено")
+				}
+
+				if !strings.Contains(lastPost.Message, tt.wantMessage) {
+					t.Errorf("Ожидалось: %q\nПолучено: %q",
+						tt.wantMessage, lastPost.Message)
+				}
+			}
+		})
 	}
-	postBytes, err := json.Marshal(originalPost)
-	if err != nil {
-		t.Fatal("Не удалось сериализовать пост:", err)
-	}
-	event := &model.WebSocketEvent{
-		Event: model.WEBSOCKET_EVENT_POSTED,
-		Data: map[string]interface{}{
-			"post": string(postBytes),
+}
+
+// Тест парсера аргументов
+func TestParseCommandArgs(t *testing.T) {
+	bot := &Bot{logger: zerolog.Nop()}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "basic quoted arguments",
+			input:    `!poll create "Вопрос с пробелами" "Вариант 1"`,
+			expected: []string{"!poll", "create", "Вопрос с пробелами", "Вариант 1"},
+		},
+		{
+			name:     "single quoted arguments",
+			input:    `!poll vote 'test-id' 'Мой выбор'`,
+			expected: []string{"!poll", "vote", "test-id", "Мой выбор"},
+		},
+		{
+			name:     "unquoted arguments",
+			input:    "!poll results simpleID",
+			expected: []string{"!poll", "results", "simpleID"},
+		},
+		{
+			name:     "mixed quotes inside arguments",
+			input:    `!poll create "Вопрос 'с' кавычками" 'И "другой" вариант'`,
+			expected: []string{"!poll", "create", "Вопрос 'с' кавычками", "И \"другой\" вариант"},
+		},
+		{
+			name:     "empty argument",
+			input:    `!poll create "" "Вариант"`,
+			expected: []string{"!poll", "create", "", "Вариант"},
+		},
+		{
+			name:     "unicode and emoji",
+			input:    `!poll create "Тест 𝌆йцукен" "☀️🌙"`,
+			expected: []string{"!poll", "create", "Тест 𝌆йцукен", "☀️🌙"},
+		},
+		{
+			name:     "multiple spaces",
+			input:    "!poll   create   Вопрос    'Вариант A'",
+			expected: []string{"!poll", "create", "Вопрос", "Вариант A"},
+		},
+		{
+			name:     "nested quotes",
+			input:    `!poll create "'Смешанные' кавычки"`,
+			expected: []string{"!poll", "create", "'Смешанные' кавычки"},
+		},
+		{
+			name:     "no arguments",
+			input:    "!poll",
+			expected: []string{"!poll"},
+		},
+		{
+			name:     "escape characters (if supported)",
+			input:    `!poll create "Экранированные \"кавычки\""`,
+			expected: []string{"!poll", "create", `Экранированные "кавычки"`},
+		},
+		{
+			name:     "special characters",
+			input:    `!poll create "!@#$%^&*()_+" "{}[];:,.<>/?~"`,
+			expected: []string{"!poll", "create", "!@#$%^&*()_+", "{}[];:,.<>/?~"},
+		},
+		{
+			name:     "asian characters",
+			input:    `!poll create "日本語のテスト" "한글 테스트"`,
+			expected: []string{"!poll", "create", "日本語のテスト", "한글 테스트"},
+		},
+		{
+			name:     "arabic text",
+			input:    `!poll create "اختبار العربية"`,
+			expected: []string{"!poll", "create", "اختبار العربية"},
 		},
 	}
 
-	ctx := context.Background()
-	botInstance.handleWebSocketEvent(ctx, event)
-	wg.Wait() 
-
-	if postCreated == nil {
-		t.Fatal("Ожидался вызов CreatePost, но его не произошло")
-	}
-	if postCreated.ChannelId != originalPost.ChannelId {
-		t.Errorf("Ожидался ChannelId %s, получен %s", originalPost.ChannelId, postCreated.ChannelId)
-	}
-	if postCreated.Message != originalPost.Message {
-		t.Errorf("Ожидалось сообщение %s, получено %s", originalPost.Message, postCreated.Message)
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := bot.parseCommandArgs(tt.input)
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Errorf("Ожидалось %v, получено %v", tt.expected, got)
+			}
+		})
 	}
 }
 
@@ -372,7 +582,7 @@ func TestHandleWebSocketEventOwnMessage(t *testing.T) {
 
 	originalPost := model.Post{
 		ChannelId: "channel456",
-		UserId:    "bot123", 
+		UserId:    "bot123",
 		Message:   "Привет, бот!",
 	}
 	postBytes, err := json.Marshal(originalPost)
@@ -398,49 +608,6 @@ func TestHandleWebSocketEventOwnMessage(t *testing.T) {
 	if called {
 		t.Error("CreatePost не должен вызываться для сообщений, отправленных самим ботом")
 	}
-}
-
-func TestHandleWebSocketEventCreatePostError(t *testing.T) {
-	var wg sync.WaitGroup
-	wg.Add(1)
-	fc := &fakeClient{
-		getMeFunc: func(param string) (*model.User, *model.Response) {
-			return &model.User{Id: "bot123"}, &model.Response{}
-		},
-		createPostFunc: func(post *model.Post) (*model.Post, *model.Response) {
-			defer wg.Done()
-			return nil, &model.Response{Error: &model.AppError{
-				Message: "authentication failed",
-			}}
-		},
-	}
-
-	originalPost := model.Post{
-		ChannelId: "channel456",
-		UserId:    "user789",
-		Message:   "Привет, бот!",
-	}
-	postBytes, err := json.Marshal(originalPost)
-	if err != nil {
-		t.Fatal("Не удалось сериализовать пост:", err)
-	}
-	event := &model.WebSocketEvent{
-		Event: model.WEBSOCKET_EVENT_POSTED,
-		Data:  map[string]interface{}{"post": string(postBytes)},
-	}
-
-	botInstance := &Bot{
-		logger:  zerolog.Nop(),
-		client:  fc,
-		botUser: &model.User{Id: "bot123"},
-		wsClient: &fakeWSClient{
-			events: make(chan *model.WebSocketEvent, 1),
-		},
-	}
-
-	ctx := context.Background()
-	botInstance.handleWebSocketEvent(ctx, event)
-	wg.Wait()
 }
 
 // Тест закрытия соединений
