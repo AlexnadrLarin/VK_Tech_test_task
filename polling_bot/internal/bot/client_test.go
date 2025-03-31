@@ -226,7 +226,7 @@ func TestInitialize_Success(t *testing.T) {
 	if apiClient, ok := bot.client.(*fakeClient); ok {
 		apiClient.Transport = &mockHTTPClient{}
 	} else {
-		t.Fatalf("Expected bot.client to be of type *fakeClient, but got %T", bot.client)
+		t.Fatalf("Ожидалась ошибка типа *fakeClient, но получено %T", bot.client)
 	}
 
 	err := bot.initialize()

@@ -1,17 +1,24 @@
-FROM golang:1.24 as builder
+FROM golang:1.24.1-alpine3.21 as builder
+
+RUN apk update && \
+    apk add --no-cache \
+    openssl-dev \
+    pkgconfig \
+    gcc \
+    musl-dev
 
 WORKDIR /polling_bot_build
 
-COPY ../go.mod ../go.sum ./
+COPY go.mod go.sum ./
 RUN go mod download
 
-COPY ../ .
+COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o polling_bot_exec ./cmd/bot/
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o polling_bot_exec ./cmd/bot/
 
 RUN go test -v ./...
 
-FROM alpine:3.18 as release
+FROM alpine:3.21 as release
 
 WORKDIR /polling_bot
 

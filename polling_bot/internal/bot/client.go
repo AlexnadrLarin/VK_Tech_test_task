@@ -186,7 +186,7 @@ func (b *Bot) handleWebSocketEvent(ctx context.Context, event *model.WebSocketEv
 
 	if err != nil {
 		b.logger.Error().Err(err).Msg("Ошибка выполнения команды")
-		responseMessage = "Ошибка при выполнении команды"
+		responseMessage = "Ошибка при выполнении команды"+err.Error()
 	}
 
 	if responseMessage != "" {

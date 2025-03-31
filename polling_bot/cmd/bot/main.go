@@ -5,13 +5,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-    "github.com/rs/zerolog"
-    "time"
+	"time"
 
 	"polling_bot/internal/bot"
 	"polling_bot/internal/config"
-    "polling_bot/internal/handler"
-    "polling_bot/internal/service"
+	"polling_bot/internal/database"
+	"polling_bot/internal/handler"
+	"polling_bot/internal/repository"
+	"polling_bot/internal/service"
+
+	"github.com/rs/zerolog"
 )
 
 func main() {
@@ -32,7 +35,16 @@ func main() {
         },
     ).With().Timestamp().Logger()
 
-    repo := service.NewInMemoryPollStorage()
+    tarantoolCfg := config.TarantoolConfigLoad()
+
+    conn, err := database.ConnectWithRetry(tarantoolCfg, logger)
+    if err != nil {
+        logger.Err(err).Msg("Не подключиться к Tarantool: %v")
+        return
+    }
+    defer conn.Close()
+    
+    repo := repository.NewTarantoolPollRepo(conn.Connection(), tarantoolCfg.Database)
 
     service := service.NewPollService(repo)
 

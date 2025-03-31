@@ -1,7 +1,9 @@
+version: '3.8'
 
 services:
   mattermost_db:
     image: postgres:16-alpine
+    container_name: mattermost_db
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -15,9 +17,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   mattermost:
     image: mattermost/mattermost-team-edition
+    container_name: mattermost
     environment:
       MM_SQLSETTINGS_DRIVERNAME: ${MM_SQLSETTINGS_DRIVERNAME}
       MM_SQLSETTINGS_DATASOURCE: ${MM_SQLSETTINGS_DATASOURCE}
@@ -34,22 +38,49 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  tarantool:
+    image: tarantool/tarantool:latest
+    container_name: tarantool
+    environment:
+      TARANTOOL_USER: ${TARANTOOL_USER}
+      TARANTOOL_PASSWORD: ${TARANTOOL_PASSWORD}
+      TARANTOOL_DATABASE: ${TARANTOOL_DATABASE}
+    volumes:
+      - ./database/tarantool/init.lua:/opt/tarantool/init.lua
+      - tarantool_data:/var/lib/tarantool
+    networks:
+      - votenet
+    command: tarantool /opt/tarantool/init.lua
+    restart: unless-stopped
 
   polling_bot:
-    build: 
+    build:
       context: ./polling_bot
+    container_name: polling_bot
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       MATTERMOST_URL: ${MATTERMOST_URL}
+      TARANTOOL_ADDR: ${TARANTOOL_ADDR}
+      TARANTOOL_USER: ${TARANTOOL_USER}
+      TARANTOOL_PASSWORD: ${TARANTOOL_PASSWORD}
+      TARANTOOL_DATABASE: ${TARANTOOL_DATABASE}
     depends_on:
       mattermost:
         condition: service_healthy
+      tarantool:
+        condition: service_started
     networks:
       - votenet
     restart: unless-stopped
 
 networks:
   votenet:
+    driver: bridge
 
 volumes:
   postgres_data:
+    driver: local
+  tarantool_data:
+    driver: local

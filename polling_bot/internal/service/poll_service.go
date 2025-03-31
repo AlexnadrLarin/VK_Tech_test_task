@@ -4,97 +4,64 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
-	"time"
+	"regexp"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"polling_bot/internal/models"
+	"polling_bot/internal/repository"
+
 )
 
-type Poll struct {
-	ID        string
-	Question  string
-	Options   map[string]int
-	Creator   string
-	CreatedAt time.Time
-	Closed    bool
-}
-
-type PollRepository interface {
-	SavePoll(ctx context.Context, poll Poll) error
-	GetPoll(ctx context.Context, id string) (Poll, error)
-	DeletePoll(ctx context.Context, id string) error
-}
-
-type InMemoryPollStorage struct {
-	mu    sync.RWMutex
-	polls map[string]Poll
-}
-
-func NewInMemoryPollStorage() *InMemoryPollStorage {
-	return &InMemoryPollStorage{
-		polls: make(map[string]Poll),
-	}
-}
-
-func (s *InMemoryPollStorage) SavePoll(ctx context.Context, poll Poll) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.polls[poll.ID] = poll
-	return nil
-}
-
-func (s *InMemoryPollStorage) GetPoll(ctx context.Context, id string) (Poll, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	poll, exists := s.polls[id]
-	if !exists {
-		return Poll{}, errors.New("poll not found")
-	}
-	return poll, nil
-}
-
-func (s *InMemoryPollStorage) DeletePoll(ctx context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.polls, id)
-	return nil
-}
+var pollIDRegex = regexp.MustCompile(`^[a-f0-9\-]{36}$`)
+const (
+	maxQuestionLength = 255
+	maxOptionLength   = 100
+)
 
 type PollService interface {
-    CreatePoll(ctx context.Context, userID, question string, options []string) (string, error)
-    AddVote(ctx context.Context, userID, pollID, choice string) (string, error)
-    GetResults(ctx context.Context, userID, pollID string) (string, error)
-    EndPoll(ctx context.Context, userID, pollID string) (string, error)
-    DeletePoll(ctx context.Context, userID, pollID string) (string, error)
+	CreatePoll(ctx context.Context, userID, question string, options []string) (string, error)
+	AddVote(ctx context.Context, userID, pollID, choice string) (string, error)
+	GetResults(ctx context.Context, userID, pollID string) (string, error)
+	EndPoll(ctx context.Context, userID, pollID string) (string, error)
+	DeletePoll(ctx context.Context, userID, pollID string) (string, error)
 }
 
 type PollServiceImpl struct {
-	repo      PollRepository
-	idGenerator func() string
+	repo repository.PollRepository
 }
 
-func NewPollService(repo PollRepository) *PollServiceImpl {
-	return &PollServiceImpl{
-		repo: repo,
-		idGenerator: func() string {
-			return fmt.Sprintf("poll-%d", time.Now().UnixNano())
-		},
-	}
+func NewPollService(repo repository.PollRepository) *PollServiceImpl {
+	return &PollServiceImpl{repo: repo}
 }
 
 func (s *PollServiceImpl) CreatePoll(ctx context.Context, userID, question string, options []string) (string, error) {
 	if len(options) < 1 {
 		return "", errors.New("должна быть хотя бы одна опция")
 	}
+	if len(question) > maxQuestionLength {
+		return "", errors.New("вопрос слишком длинный")
+	}
+	for _, option := range options {
+		if len(option) > maxOptionLength {
+			return "", errors.New("вариант ответа слишком длинный")
+		}
+	}
 
-	poll := Poll{
-		ID:        s.idGenerator(),
-		Question:  question,
-		Options:   make(map[string]int),
-		Creator:   userID,
-		CreatedAt: time.Now(),
-		Closed:    false,
+	poll := models.Poll{
+		ID:       uuid.New().String(),
+		Creator:  userID,
+		Question: question,
+		Options:  make(map[string]int),
+		Voters:   make(map[string]bool),
+		Closed:   false,
 	}
 
 	for _, option := range options {
+		if _, exists := poll.Options[option]; exists {
+			return "", errors.New("все опции в голосовании должны быть уникальными")
+		}
 		poll.Options[option] = 0
 	}
 
@@ -102,69 +69,77 @@ func (s *PollServiceImpl) CreatePoll(ctx context.Context, userID, question strin
 		return "", fmt.Errorf("ошибка сохранения опроса: %w", err)
 	}
 
-	return fmt.Sprintf("Голосование создано успешно! ID: `%s`\nВопрос: %s\nВарианты: %v", 
-		poll.ID, poll.Question, options), nil
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Голосование создано успешно! ID: `%s`\nВопрос: %s\nВарианты:\n", poll.ID, poll.Question))
+	for i, option := range options {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, option))
+	}
+
+	return sb.String(), nil
 }
 
-func (s *PollServiceImpl) AddVote(ctx context.Context, userID string, pollID string, choice string) (string, error) {
+func (s *PollServiceImpl) AddVote(ctx context.Context, userID, pollID, choice string) (string, error) {
+	if !pollIDRegex.MatchString(pollID) {
+		return "", errors.New("неверный формат ID опроса")
+	}
+
 	poll, err := s.repo.GetPoll(ctx, pollID)
 	if err != nil {
 		return "", errors.New("опрос не найден")
 	}
-
 	if poll.Closed {
 		return "", errors.New("опрос завершен")
 	}
-
+	if poll.Voters[userID] {
+		return "", errors.New("вы уже голосовали в этом опросе")
+	}
 	if _, exists := poll.Options[choice]; !exists {
 		return "", fmt.Errorf("вариант '%s' не существует", choice)
 	}
 
+	poll.Voters[userID] = true
 	poll.Options[choice]++
-	if err := s.repo.SavePoll(ctx, poll); err != nil {
+	if err := s.repo.AddVoteAtomic(ctx, poll); err != nil {
 		return "", fmt.Errorf("ошибка сохранения голоса: %w", err)
 	}
 
 	return fmt.Sprintf("Ваш голос в голосовании %s записан: %s", pollID, choice), nil
 }
 
-func (s *PollServiceImpl) GetResults(ctx context.Context, userID string, pollID string) (string, error) {
+func (s *PollServiceImpl) GetResults(ctx context.Context, userID, pollID string) (string, error) {
 	poll, err := s.repo.GetPoll(ctx, pollID)
 	if err != nil {
 		return "", errors.New("опрос не найден")
 	}
 
-	result := fmt.Sprintf("**Результаты опроса %s**\n%s\n", pollID, poll.Question)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("**Результаты опроса %s**\n%s\n", pollID, poll.Question))
 	for option, count := range poll.Options {
-		result += fmt.Sprintf("- %s: %d голосов\n", option, count)
+		sb.WriteString(fmt.Sprintf("- %s: %d голосов\n", option, count))
 	}
-	return result, nil
+	return sb.String(), nil
 }
 
-func (s *PollServiceImpl) EndPoll(ctx context.Context, userID string, pollID string) (string, error) {
+func (s *PollServiceImpl) EndPoll(ctx context.Context, userID, pollID string) (string, error) {
 	poll, err := s.repo.GetPoll(ctx, pollID)
 	if err != nil {
 		return "", errors.New("опрос не найден")
 	}
-
 	if poll.Creator != userID {
 		return "", errors.New("только создатель может завершить опрос")
 	}
 
-	poll.Closed = true
-	if err := s.repo.SavePoll(ctx, poll); err != nil {
+	if err := s.repo.ClosePoll(ctx, pollID); err != nil {
 		return "", fmt.Errorf("ошибка завершения опроса: %w", err)
 	}
-
 	return fmt.Sprintf("Голосование %s окончено", pollID), nil
 }
 
-func (s *PollServiceImpl) DeletePoll(ctx context.Context, userID string, pollID string) (string, error) {
+func (s *PollServiceImpl) DeletePoll(ctx context.Context, userID, pollID string) (string, error) {
 	poll, err := s.repo.GetPoll(ctx, pollID)
 	if err != nil {
 		return "", errors.New("опрос не найден")
 	}
-
 	if poll.Creator != userID {
 		return "", errors.New("только создатель может удалить опрос")
 	}
@@ -172,6 +147,5 @@ func (s *PollServiceImpl) DeletePoll(ctx context.Context, userID string, pollID 
 	if err := s.repo.DeletePoll(ctx, pollID); err != nil {
 		return "", fmt.Errorf("ошибка удаления опроса: %w", err)
 	}
-
 	return fmt.Sprintf("Голосование %s удалено", pollID), nil
 }
